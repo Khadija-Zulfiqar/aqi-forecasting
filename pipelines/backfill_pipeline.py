@@ -1,6 +1,4 @@
 # pipelines/backfill_pipeline.py
-# Fetches historical AQI data to build training dataset
-
 import os
 import requests
 import pandas as pd
@@ -11,62 +9,68 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-AQICN_TOKEN       = os.getenv("AQICN_TOKEN")
+OPENWEATHER_KEY   = os.getenv("OPENWEATHER_API_KEY")
 HOPSWORKS_API_KEY = os.getenv("HOPSWORKS_API_KEY")
 HOPSWORKS_PROJECT = os.getenv("HOPSWORKS_PROJECT", "aqiforecasting")
-CITY              = "karachi"
+LAT, LON          = 24.8607, 67.0011
 
 # ─────────────────────────────────────────
-# 1. FETCH HISTORICAL DATA FROM AQICN
+# 1. FETCH HISTORICAL AQI FROM OPENWEATHER
 # ─────────────────────────────────────────
-def fetch_historical_aqi(date_str):
-    """Fetch AQI data for a specific date (YYYY-MM-DD)"""
-    url = f"https://api.waqi.info/feed/{CITY}/?token={AQICN_TOKEN}"
-    response = requests.get(url)
-    data = response.json()
+def fetch_historical_data(dt: datetime):
+    """Fetch air pollution + weather for a specific past datetime"""
+    unix_ts = int(dt.timestamp())
 
-    if data["status"] != "ok":
+    # Air pollution history
+    aqi_url = f"http://api.openweathermap.org/data/2.5/air_pollution/history?lat={LAT}&lon={LON}&start={unix_ts}&end={unix_ts+3600}&appid={OPENWEATHER_KEY}"
+    aqi_r = requests.get(aqi_url).json()
+
+    if not aqi_r.get("list"):
         return None
 
-    d = data["data"]
-    iaqi = d.get("iaqi", {})
+    components = aqi_r["list"][0]["components"]
+    ow_aqi     = aqi_r["list"][0]["main"]["aqi"]
+    aqi = pm25_to_aqi(components["pm2_5"])
 
     return {
-        "aqi":          d["aqi"],
-        "pm25":         iaqi.get("pm25", {}).get("v", np.nan),
-        "pm10":         iaqi.get("pm10", {}).get("v", np.nan),
-        "o3":           iaqi.get("o3",   {}).get("v", np.nan),
-        "no2":          iaqi.get("no2",  {}).get("v", np.nan),
-        "so2":          iaqi.get("so2",  {}).get("v", np.nan),
-        "co":           iaqi.get("co",   {}).get("v", np.nan),
-        "humidity":     iaqi.get("h",    {}).get("v", np.nan),
-        "temp":         iaqi.get("t",    {}).get("v", np.nan),
-        "pressure":     iaqi.get("p",    {}).get("v", np.nan),
-        "wind":         iaqi.get("w",    {}).get("v", np.nan),
-        "dew":          iaqi.get("dew",  {}).get("v", np.nan),
-        "visibility":   np.nan,
-        "cloud_cover":  np.nan,
-        "weather_main": "Unknown",
+        "aqi":  aqi,
+        "pm25": components.get("pm2_5", 0),
+        "pm10": components.get("pm10",  0),
+        "o3":   components.get("o3",    0),
+        "no2":  components.get("no2",   0),
+        "so2":  components.get("so2",   0),
+        "co":   components.get("co",    0),
+    }
+
+def fetch_historical_weather(dt: datetime):
+    """Fetch historical weather using One Call API"""
+    unix_ts = int(dt.timestamp())
+    url = f"https://api.openweathermap.org/data/2.5/onecall/timemachine?lat={LAT}&lon={LON}&dt={unix_ts}&appid={OPENWEATHER_KEY}&units=metric"
+    r = requests.get(url)
+
+    if r.status_code != 200:
+        return {
+            "temp": 30, "humidity": 60, "pressure": 1013,
+            "wind": 5, "dew": 15, "visibility": 8000.0,
+            "cloud_cover": 30.0, "weather_main": "Clear"
+        }
+
+    data = r.json()
+    current = data.get("current", data.get("hourly", [{}])[0])
+    return {
+        "temp":         current.get("temp", 30),
+        "humidity":     current.get("humidity", 60),
+        "pressure":     current.get("pressure", 1013),
+        "wind":         current.get("wind_speed", 5),
+        "dew":          current.get("dew_point", 15),
+        "visibility":   float(current.get("visibility", 8000)),
+        "cloud_cover":  float(current.get("clouds", 30)),
+        "weather_main": current.get("weather", [{"main": "Clear"}])[0]["main"],
     }
 
 # ─────────────────────────────────────────
-# 2. ENGINEER FEATURES FOR HISTORICAL DATE
+# 2. ENGINEER FEATURES
 # ─────────────────────────────────────────
-def engineer_features(raw, date_str):
-    dt = datetime.strptime(date_str, "%Y-%m-%d")
-
-    return {
-        **raw,
-        "timestamp": pd.Timestamp(date_str + " 12:00:00"),
-        "hour":         12,
-        "day":          dt.day,
-        "month":        dt.month,
-        "day_of_week":  dt.weekday(),
-        "is_weekend":   int(dt.weekday() >= 5),
-        "is_rush_hour": 0,
-        "aqi_category": categorize_aqi(raw["aqi"]),
-    }
-
 def categorize_aqi(aqi):
     if aqi <= 50:    return 1
     elif aqi <= 100: return 2
@@ -75,20 +79,23 @@ def categorize_aqi(aqi):
     elif aqi <= 300: return 5
     else:            return 6
 
-# ─────────────────────────────────────────
-# 3. GENERATE DATE RANGE
-# ─────────────────────────────────────────
-def generate_date_range(days_back=180):
-    """Generate list of dates from today going back N days"""
-    dates = []
-    today = datetime.now()
-    for i in range(days_back, 0, -1):
-        date = today - timedelta(days=i)
-        dates.append(date.strftime("%Y-%m-%d"))
-    return dates
+def engineer_features(aqi_data, weather_data, dt):
+    return {
+        **aqi_data,
+        **{k: v for k, v in weather_data.items() if k != "weather_main"},
+        "weather_main": weather_data["weather_main"],
+        "timestamp":    dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "hour":         dt.hour,
+        "day":          dt.day,
+        "month":        dt.month,
+        "day_of_week":  dt.weekday(),
+        "is_weekend":   int(dt.weekday() >= 5),
+        "is_rush_hour": int(dt.hour in [7, 8, 9, 17, 18, 19]),
+        "aqi_category": categorize_aqi(aqi_data["aqi"]),
+    }
 
 # ─────────────────────────────────────────
-# 4. STORE IN HOPSWORKS
+# 3. STORE IN HOPSWORKS
 # ─────────────────────────────────────────
 def store_features(df):
     print("🔗 Connecting to Hopsworks...")
@@ -97,38 +104,49 @@ def store_features(df):
         api_key_value=HOPSWORKS_API_KEY,
         project=HOPSWORKS_PROJECT,
     )
-
     fs = project.get_feature_store()
-
     fg = fs.get_or_create_feature_group(
         name="aqi_features",
         version=1,
         description="Hourly AQI and weather features for Karachi",
         primary_key=["timestamp"],
         event_time="timestamp",
+        online_enabled=False,
     )
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df["timestamp"]   = pd.to_datetime(df["timestamp"])
+    df["visibility"]  = df["visibility"].astype(float)
+    df["cloud_cover"] = df["cloud_cover"].astype(float)
+    df["aqi"]         = df["aqi"].astype("int64")
+    df["pm25"]        = df["pm25"].astype("int64")
+    df["temp"]        = df["temp"].astype("int64")
+    df["dew"]         = df["dew"].astype("int64")
+    df["day_of_week"] = df["day_of_week"].astype("int64")
+    df["is_weekend"]  = df["is_weekend"].astype("int64")
+    df["is_rush_hour"]= df["is_rush_hour"].astype("int64")
+
     fg.insert(df, write_options={"wait_for_job": False})
-    print(f"✅ Stored {len(df)} rows successfully!")
+    print(f"✅ Stored {len(df)} rows!")
 
 # ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
-def run_backfill(days_back=180):
-    print(f"🚀 Starting backfill for last {days_back} days...")
-
-    dates = generate_date_range(days_back)
+def run_backfill(days_back=30):
+    print(f"🚀 Backfill for last {days_back} days using OpenWeather...")
     records = []
+    now = datetime.utcnow()
 
-    for i, date_str in enumerate(dates):
-        print(f"📡 Fetching {date_str} ({i+1}/{len(dates)})...")
-        raw = fetch_historical_aqi(date_str)
+    total = days_back * 24
+    for i in range(total, 0, -1):
+        dt = now - timedelta(hours=i)
+        print(f"📡 {dt.strftime('%Y-%m-%d %H:00')} ({total-i+1}/{total})...")
 
-        if raw is None:
-            print(f"   ⚠️  Skipping {date_str} — no data")
+        aqi_data = fetch_historical_data(dt)
+        if aqi_data is None:
+            print("   ⚠️  Skipping — no data")
             continue
 
-        features = engineer_features(raw, date_str)
+        weather_data = fetch_historical_weather(dt)
+        features = engineer_features(aqi_data, weather_data, dt)
         records.append(features)
 
     if not records:
@@ -136,34 +154,17 @@ def run_backfill(days_back=180):
         return
 
     df = pd.DataFrame(records)
-
-    # Add lag features (previous day AQI)
-    df["aqi_lag_1"] = df["aqi"].shift(1)
-    df["aqi_lag_2"] = df["aqi"].shift(2)
-    df["aqi_lag_3"] = df["aqi"].shift(3)
-
-    # Rolling average (3-day and 7-day)
-    df["aqi_rolling_3"] = df["aqi"].rolling(window=3).mean()
-    df["aqi_rolling_7"] = df["aqi"].rolling(window=7).mean()
-
-    # AQI change rate
+    df["aqi_lag_1"]       = df["aqi"].shift(1)
+    df["aqi_lag_2"]       = df["aqi"].shift(2)
+    df["aqi_lag_3"]       = df["aqi"].shift(3)
+    df["aqi_rolling_3"]   = df["aqi"].rolling(3).mean()
+    df["aqi_rolling_7"]   = df["aqi"].rolling(7).mean()
     df["aqi_change_rate"] = df["aqi"].pct_change()
+    df = df.dropna(subset=["aqi_lag_3"]).fillna(0)
 
-    # Drop rows with NaN from lag features
-    df = df.dropna(subset=["aqi_lag_3"])
-    df = df.fillna(0)
-
-    print(f"\n📊 Dataset Summary:")
-    print(f"   Total records : {len(df)}")
-    print(f"   Date range    : {df['timestamp'].min()} → {df['timestamp'].max()}")
-    print(f"   Avg AQI       : {df['aqi'].mean():.1f}")
-    print(f"   Max AQI       : {df['aqi'].max()}")
-    print(f"   Min AQI       : {df['aqi'].min()}")
-    print(f"   Columns       : {list(df.columns)}")
-
+    print(f"\n📊 Summary: {len(df)} rows | AQI: {df['aqi'].min()}-{df['aqi'].max()} | Avg: {df['aqi'].mean():.1f}")
     store_features(df)
-    print("\n✅ Backfill complete!")
+    print("✅ Backfill complete!")
 
 if __name__ == "__main__":
-    run_backfill(days_back=180)
-
+    run_backfill(days_back=30)
