@@ -20,7 +20,7 @@ df = df.rename(columns={'temperature': 'temp'})
 df = df.drop(columns=['id', 'city', 'created_at'], errors='ignore')
 
 # ── Fix timestamp ──
-df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', utc=True)
 df['timestamp'] = df['timestamp'].dt.tz_localize(None)
 df = df.sort_values('timestamp').reset_index(drop=True)
 
@@ -53,9 +53,19 @@ df['aqi_rolling_7']   = df['aqi'].rolling(7).mean()
 df['aqi_change_rate'] = df['aqi'].pct_change()
 
 # ── Clean up ──
+# ── Clean up ──
 df = df.dropna(subset=['aqi_lag_3']).fillna(0)
-df['visibility']  = df['visibility'].astype(float)
-df['cloud_cover'] = df['cloud_cover'].astype(float)
+
+# Fix types to match Hopsworks schema
+df['aqi']          = df['aqi'].astype(float).astype('int64')
+df['pm25']         = df['pm25'].astype(float).astype('int64')
+df['temp']         = df['temp'].astype(float).astype('int64')
+df['dew']          = df['dew'].astype(float).astype('int64')
+df['day_of_week']  = df['day_of_week'].astype('int64')
+df['is_weekend']   = df['is_weekend'].astype('int64')
+df['is_rush_hour'] = df['is_rush_hour'].astype('int64')
+df['visibility']   = df['visibility'].astype(float)
+df['cloud_cover']  = df['cloud_cover'].astype(float)
 
 print(f"\n✅ Prepared {len(df)} rows")
 print(f"   Date range : {df['timestamp'].min()} → {df['timestamp'].max()}")

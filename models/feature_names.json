@@ -1,0 +1,1 @@
+["pm25", "pm10", "o3", "no2", "so2", "co", "humidity", "temp", "pressure", "wind", "dew", "hour", "day", "month", "day_of_week", "is_weekend", "is_rush_hour", "aqi_lag_1", "aqi_lag_2", "aqi_lag_3", "aqi_rolling_3", "aqi_rolling_7", "aqi_change_rate", "cloud_cover"]
